@@ -1,0 +1,33 @@
+# .goreleaser.yml
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+
+version: 2
+
+env:
+  - GO111MODULE=on
+  - GOPROXY=https://proxy.golang.org
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - binary: vpn-kinit
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: '{{ .CommitTimestamp }}'
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+
+release:
+  github:
+    owner: cblecker
+    name: vpn-kinit
+  prerelease: auto
