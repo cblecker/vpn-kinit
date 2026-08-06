@@ -13,8 +13,10 @@ permissions:
 
 jobs:
   test:
-    name: Run on macOS
-    runs-on: macos-latest
+    name: Run on Ubuntu
+    runs-on: ubuntu-latest
+    env:
+      GOOS: darwin
     steps:
       - name: Clone the code
         uses: actions/checkout@v7
