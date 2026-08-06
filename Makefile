@@ -26,7 +26,7 @@ install: build
 	@test "$$(uname -s)" = "Darwin" || (echo "install must run on macOS" && exit 1)
 	install -d $(BINDIR) $(HOME)/Library/LaunchAgents
 	install -m 0755 bin/$(BINARY) $(BINDIR)/$(BINARY)
-	-launchctl bootout gui/$(UID)/$(LABEL) 2>/dev/null
+	launchctl bootout gui/$(UID)/$(LABEL) 2>/dev/null || true
 	sed -e 's|@BINARY@|$(BINDIR)/$(BINARY)|g' \
 	    -e 's|@HOME@|$(HOME)|g' $(PLIST_IN) > $(PLIST_OUT)
 	plutil -lint $(PLIST_OUT)
@@ -34,7 +34,7 @@ install: build
 
 uninstall:
 	@test "$$(uname -s)" = "Darwin" || (echo "uninstall must run on macOS" && exit 1)
-	-launchctl bootout gui/$(UID)/$(LABEL) 2>/dev/null
+	launchctl bootout gui/$(UID)/$(LABEL) 2>/dev/null || true
 	rm -f $(PLIST_OUT) $(BINDIR)/$(BINARY)
 
 clean:
