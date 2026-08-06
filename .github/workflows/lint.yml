@@ -12,10 +12,14 @@ permissions:
 
 jobs:
   lint:
-    name: Run on Ubuntu
+    name: Lint (${{ matrix.goos }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos:
+        - darwin
     env:
-      GOOS: darwin
+      GOOS: ${{ matrix.goos }}
     steps:
       - name: Clone the code
         uses: actions/checkout@v7
