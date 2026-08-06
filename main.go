@@ -1,14 +1,16 @@
-//go:build darwin
-
-// Command vpn-kinit watches for a WireGuard utun interface (NetBird's
-// tunnel) to come up and runs kinit once per up-transition, acquiring
-// Kerberos tickets using the password stored in the login Keychain.
-// It is designed to run as a per-user LaunchAgent. See README.md.
+// Command vpn-kinit watches for a VPN tunnel interface (NetBird's
+// WireGuard interface) to come up and runs kinit once per
+// up-transition. On macOS, kinit acquires tickets using the password
+// stored in the login Keychain, and vpn-kinit runs as a per-user
+// LaunchAgent. See README.md.
+//
+// The platform-specific piece is the route monitor that hints when the
+// routing table changes (route_darwin.go); everything in this file is
+// portable.
 package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"log/slog"
 	"net"
@@ -19,8 +21,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -28,14 +28,12 @@ const (
 	kinitTimeout   = 30 * time.Second
 	probeTimeout   = 3 * time.Second
 	maxAttempts    = 10 // kinit attempts per up-transition
-	readBufSize    = 4096
-	reopenBackoff  = 5 * time.Second
 	krb5ConfPath   = "/etc/krb5.conf"
 	kerberosPort   = "88"
 )
 
 func main() {
-	ifaceName := flag.String("interface", "utun100", "tunnel interface to watch")
+	ifaceName := flag.String("interface", defaultInterface, "tunnel interface to watch")
 	kinitPath := flag.String("kinit", "/usr/bin/kinit", "path to kinit")
 	cooldown := flag.Duration("cooldown", 30*time.Second, "minimum interval between kinit attempts")
 	kdcFlag := flag.String("kdc", "", "KDC to probe for reachability as host[:port] (default: auto-discover from /etc/krb5.conf or DNS SRV)")
@@ -51,7 +49,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	m := &monitor{iface: *ifaceName, kinit: *kinitPath, cooldown: *cooldown, log: log}
+	m := &monitor{
+		iface:     *ifaceName,
+		kinit:     *kinitPath,
+		kinitArgs: flag.Args(), // anything after "--" is passed to kinit
+		cooldown:  *cooldown,
+		log:       log,
+	}
 	m.discoverKDC(*kdcFlag)
 
 	events := make(chan struct{}, 1) // capacity 1: bursts coalesce
@@ -78,12 +82,13 @@ func main() {
 // monitor holds the edge-detection state machine. All fields are only
 // accessed from the main goroutine.
 type monitor struct {
-	iface    string
-	kinit    string
-	cooldown time.Duration
-	kdc      string // host:port to probe; empty means no probe possible (yet)
-	realm    string // for lazy DNS SRV discovery when kdc is empty
-	log      *slog.Logger
+	iface     string
+	kinit     string
+	kinitArgs []string
+	cooldown  time.Duration
+	kdc       string // host:port to probe; empty means no probe possible (yet)
+	realm     string // for lazy DNS SRV discovery when kdc is empty
+	log       *slog.Logger
 
 	wasUp       bool
 	done        bool      // kinit succeeded for the current up-period
@@ -151,7 +156,7 @@ func (m *monitor) tryKinit(ctx context.Context) {
 
 	cctx, cancel := context.WithTimeout(ctx, kinitTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(cctx, m.kinit).CombinedOutput()
+	out, err := exec.CommandContext(cctx, m.kinit, m.kinitArgs...).CombinedOutput()
 	if err != nil {
 		m.log.Error("kinit failed", "attempt", m.attempts, "max", maxAttempts,
 			"err", err, "output", strings.TrimSpace(string(out)))
@@ -246,92 +251,4 @@ func parseKrb5Conf(path string) (realm string, kdcs []string) {
 		}
 	}
 	return realm, realmKDCs[realm]
-}
-
-// openRouteSocket returns an *os.File wrapping a non-blocking AF_ROUTE
-// socket. Non-blocking + os.NewFile registers the fd with the runtime
-// poller, so Read parks there and f.Close() safely interrupts it.
-func openRouteSocket() (*os.File, error) {
-	fd, err := unix.Socket(unix.AF_ROUTE, unix.SOCK_RAW, unix.AF_UNSPEC)
-	if err != nil {
-		return nil, err
-	}
-	if err := unix.SetNonblock(fd, true); err != nil {
-		_ = unix.Close(fd)
-		return nil, err
-	}
-	return os.NewFile(uintptr(fd), "route"), nil
-}
-
-// routeListen owns the route socket lifecycle: open, read until error,
-// reopen with backoff, exit on ctx cancellation. Message contents are
-// never parsed -- any routing activity is only a hint to re-evaluate
-// the interface state, which makes dropped or truncated messages
-// harmless.
-func routeListen(ctx context.Context, notify chan<- struct{}, log *slog.Logger) {
-	for {
-		f, err := openRouteSocket()
-		if err != nil {
-			log.Error("open route socket", "err", err)
-			if !sleepCtx(ctx, reopenBackoff) {
-				return
-			}
-			continue
-		}
-		done := make(chan struct{})
-		go func() { // unblocks Read on shutdown
-			select {
-			case <-ctx.Done():
-				_ = f.Close()
-			case <-done:
-			}
-		}()
-		err = readLoop(ctx, f, notify)
-		close(done)
-		_ = f.Close()
-		if ctx.Err() != nil {
-			return
-		}
-		log.Warn("route socket read failed, reopening", "err", err)
-		poke(notify) // events may have been missed while the socket was down
-		if !sleepCtx(ctx, reopenBackoff) {
-			return
-		}
-	}
-}
-
-func readLoop(ctx context.Context, f *os.File, notify chan<- struct{}) error {
-	buf := make([]byte, readBufSize)
-	for {
-		_, err := f.Read(buf)
-		if ctx.Err() != nil {
-			return nil // shutdown: Close() already interrupted us
-		}
-		if err != nil {
-			// ENOBUFS means the kernel dropped events under churn:
-			// that in itself signals a change.
-			if errors.Is(err, unix.ENOBUFS) || errors.Is(err, unix.EINTR) {
-				poke(notify)
-				continue
-			}
-			return err
-		}
-		poke(notify)
-	}
-}
-
-func poke(ch chan<- struct{}) {
-	select {
-	case ch <- struct{}{}:
-	default: // an evaluate is already pending; coalesce
-	}
-}
-
-func sleepCtx(ctx context.Context, d time.Duration) bool {
-	select {
-	case <-ctx.Done():
-		return false
-	case <-time.After(d):
-		return true
-	}
 }

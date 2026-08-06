@@ -49,6 +49,11 @@ Flags (set in the `ProgramArguments` array of
 | `-kdc`       | auto             | KDC to probe as `host[:port]`                    |
 | `-debug`     | off              | Debug logging (including failed KDC probes)      |
 
+Anything after a `--` separator is passed through as arguments to
+kinit — useful for keytab-based setups (e.g.
+`vpn-kinit -- -kt /path/to/keytab user@REALM`). On macOS with the
+password in the login Keychain, no arguments are needed.
+
 If you run NetBird with a custom `--interface-name`, set `-interface`
 to match. The KDC to probe is auto-discovered from `/etc/krb5.conf`
 (`default_realm` + that realm's `kdc` entries), falling back to a DNS
