@@ -1,0 +1,33 @@
+name: Tests
+
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+    branches:
+    - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Run on macOS
+    runs-on: macos-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: make build
+
+      - name: Running Tests
+        run: go test ./...
