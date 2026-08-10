@@ -57,7 +57,7 @@ func TestReadLoop(t *testing.T) {
 		done := make(chan error, 1)
 		go func() { done <- readLoop(ctx, r, notify) }()
 
-		if _, err := w.Write([]byte("a route message")); err != nil {
+		if _, err := w.WriteString("a route message"); err != nil {
 			t.Fatal(err)
 		}
 		select {

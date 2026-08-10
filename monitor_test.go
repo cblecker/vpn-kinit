@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -23,7 +22,7 @@ import (
 // discardLog returns a logger for tests: every path here logs, and none
 // of that output is under test.
 func discardLog() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+	return slog.New(slog.DiscardHandler)
 }
 
 // script writes an executable shell script into dir and returns its path.
@@ -63,11 +62,15 @@ func stamp(d time.Duration) string {
 	return time.Now().Add(d).Format(klistTimestamp)
 }
 
-// klistJSON is `klist --json` output holding one krbtgt for realm.
-func klistJSON(realm, issued, expires string) string {
+// testRealm is the cache principal's realm in the klist fixtures. Cases
+// that need a second realm spell the JSON out inline instead.
+const testRealm = "EXAMPLE.COM"
+
+// klistJSON is `klist --json` output holding one krbtgt for testRealm.
+func klistJSON(issued, expires string) string {
 	return fmt.Sprintf(`{"principal":"me@%[1]s","tickets":[
 		{"Issued":%[2]q,"Expires":%[3]q,"Principal":"krbtgt/%[1]s@%[1]s"}]}`,
-		realm, issued, expires)
+		testRealm, issued, expires)
 }
 
 // klistScript installs a klist printing out, and returns its path and its
@@ -185,13 +188,13 @@ func TestTicketExpiry(t *testing.T) {
 		},
 		{
 			name: "an unparseable expiry skips the ticket",
-			out:  klistJSON("EXAMPLE.COM", iss, "not-a-timestamp"),
+			out:  klistJSON(iss, "not-a-timestamp"),
 		},
 		{
 			// The issue time only feeds optional checks, so losing it
 			// must not cost us the expiry.
 			name:        "an unparseable issue time still yields the expiry",
-			out:         klistJSON("EXAMPLE.COM", "not-a-timestamp", exp8),
+			out:         klistJSON("not-a-timestamp", exp8),
 			wantExpires: exp8,
 		},
 		{
@@ -271,7 +274,7 @@ func TestTicketExpiring(t *testing.T) {
 
 	t.Run("a cached expiry inside the margin is re-read", func(t *testing.T) {
 		dir := t.TempDir()
-		klist, calls := klistScript(t, dir, klistJSON("EXAMPLE.COM", stamp(0), stamp(10*time.Hour)))
+		klist, calls := klistScript(t, dir, klistJSON(stamp(0), stamp(10*time.Hour)))
 		m := &monitor{
 			klist:     klist,
 			refresh:   time.Hour,
@@ -296,7 +299,7 @@ func TestTicketExpiring(t *testing.T) {
 
 	t.Run("a ticket inside the margin is expiring", func(t *testing.T) {
 		dir := t.TempDir()
-		klist, _ := klistScript(t, dir, klistJSON("EXAMPLE.COM", stamp(-9*time.Hour), stamp(30*time.Minute)))
+		klist, _ := klistScript(t, dir, klistJSON(stamp(-9*time.Hour), stamp(30*time.Minute)))
 		m := &monitor{klist: klist, refresh: time.Hour, log: discardLog()}
 		if !m.ticketExpiring(context.Background()) {
 			t.Error("ticketExpiring() = false for a ticket with 30m left")
@@ -317,7 +320,7 @@ func TestTryKinit(t *testing.T) {
 	t.Run("success records the expiry and the args reach kinit", func(t *testing.T) {
 		dir := t.TempDir()
 		kinit, kinitCalls := recorder(t, dir, "kinit", "exit 0")
-		klist, _ := klistScript(t, dir, klistJSON("EXAMPLE.COM", stamp(0), stamp(10*time.Hour)))
+		klist, _ := klistScript(t, dir, klistJSON(stamp(0), stamp(10*time.Hour)))
 		m := &monitor{
 			kinit:     kinit,
 			kinitArgs: []string{"-kt", "/path/to/keytab", "user@REALM"},
@@ -401,7 +404,7 @@ func TestTryKinit(t *testing.T) {
 		dir := t.TempDir()
 		kinit, _ := recorder(t, dir, "kinit", "exit 0")
 		// Timestamps in some other timezone can read as long past.
-		klist, _ := klistScript(t, dir, klistJSON("EXAMPLE.COM", stamp(-20*time.Hour), stamp(-10*time.Hour)))
+		klist, _ := klistScript(t, dir, klistJSON(stamp(-20*time.Hour), stamp(-10*time.Hour)))
 		m := &monitor{kinit: kinit, klist: klist, refresh: time.Hour, log: discardLog()}
 		m.tryKinit(ctx)
 
@@ -442,7 +445,7 @@ func TestTryKinit(t *testing.T) {
 	t.Run("refresh disabled skips the expiry read", func(t *testing.T) {
 		dir := t.TempDir()
 		kinit, _ := recorder(t, dir, "kinit", "exit 0")
-		klist, klistCalls := klistScript(t, dir, klistJSON("EXAMPLE.COM", stamp(0), stamp(10*time.Hour)))
+		klist, klistCalls := klistScript(t, dir, klistJSON(stamp(0), stamp(10*time.Hour)))
 		m := &monitor{kinit: kinit, klist: klist, refresh: 0, log: discardLog()}
 		m.tryKinit(ctx)
 
@@ -521,7 +524,7 @@ func TestEvaluate(t *testing.T) {
 	})
 
 	t.Run("coming up with a valid ticket skips kinit", func(t *testing.T) {
-		h := newHarness(t, klistJSON("EXAMPLE.COM", stamp(0), stamp(10*time.Hour)))
+		h := newHarness(t, klistJSON(stamp(0), stamp(10*time.Hour)))
 		h.up = true
 		h.m.evaluate(ctx)
 		// A daemon restart or a brief flap should not burn a kinit.
@@ -557,7 +560,7 @@ func TestEvaluate(t *testing.T) {
 	})
 
 	t.Run("an expiring ticket starts a fresh round", func(t *testing.T) {
-		h := newHarness(t, klistJSON("EXAMPLE.COM", stamp(-9*time.Hour), stamp(30*time.Minute)))
+		h := newHarness(t, klistJSON(stamp(-9*time.Hour), stamp(30*time.Minute)))
 		// Steady state, one attempt already spent, ticket nearly gone.
 		h.up = true
 		h.m.wasUp, h.m.done, h.m.attempts = true, true, 4
@@ -575,7 +578,7 @@ func TestEvaluate(t *testing.T) {
 	})
 
 	t.Run("going down resets the up-period state", func(t *testing.T) {
-		h := newHarness(t, klistJSON("EXAMPLE.COM", stamp(0), stamp(10*time.Hour)))
+		h := newHarness(t, klistJSON(stamp(0), stamp(10*time.Hour)))
 		h.up = true
 		h.m.evaluate(ctx)
 		h.up = false
@@ -592,7 +595,7 @@ func TestEvaluate(t *testing.T) {
 	})
 
 	t.Run("refresh disabled leaves an up tunnel alone", func(t *testing.T) {
-		h := newHarness(t, klistJSON("EXAMPLE.COM", stamp(-9*time.Hour), stamp(time.Minute)))
+		h := newHarness(t, klistJSON(stamp(-9*time.Hour), stamp(time.Minute)))
 		h.m.refresh = 0
 		h.up = true
 		h.m.evaluate(ctx)
