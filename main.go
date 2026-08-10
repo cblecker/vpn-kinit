@@ -33,13 +33,16 @@ import (
 // plain `go build` leaves it at "dev".
 var version = "dev"
 
+// krb5ConfPath is where KDC discovery looks for the Kerberos
+// configuration. A variable so tests can point it at a fixture.
+var krb5ConfPath = "/etc/krb5.conf"
+
 const (
 	tickerInterval = 60 * time.Second // backstop for missed route events (e.g. across sleep/wake)
 	kinitTimeout   = 30 * time.Second
 	probeTimeout   = 3 * time.Second
 	klistTimeout   = 5 * time.Second
 	maxAttempts    = 10 // kinit attempts per up-transition
-	krb5ConfPath   = "/etc/krb5.conf"
 	kerberosPort   = "88"
 
 	// klistTimestamp is the timestamp layout in `klist --json` output,
@@ -197,6 +200,12 @@ type monitor struct {
 	realm     string        // for lazy DNS SRV discovery when kdc is empty
 	log       *slog.Logger
 
+	// ifaceUp reports whether iface is up. Nil, outside tests, means ask
+	// the kernel: the interface is the one input with no path through the
+	// fields above, and faking a tunnel coming and going is the only way
+	// to drive the transitions in evaluate.
+	ifaceUp func(string) bool
+
 	wasUp       bool
 	done        bool      // kinit succeeded for the current up-period
 	attempts    int       // kinit attempts in the current up-period
@@ -233,13 +242,29 @@ func (m *monitor) discoverKDC(flagVal string) {
 	m.log.Warn("no KDC discovered; kinit will run without a reachability probe")
 }
 
+// interfaceUp reports whether the named interface exists and is up. A
+// missing interface is not an error here: NetBird's utun only exists
+// while the tunnel does, so "no such interface" is the normal down state.
 func interfaceUp(name string) bool {
 	ifi, err := net.InterfaceByName(name)
 	return err == nil && ifi.Flags&net.FlagUp != 0
 }
 
+// up reports whether the watched interface is up, through the ifaceUp
+// seam when one is installed.
+func (m *monitor) up() bool {
+	if m.ifaceUp != nil {
+		return m.ifaceUp(m.iface)
+	}
+	return interfaceUp(m.iface)
+}
+
+// evaluate runs the edge detection: it compares the interface's current
+// state against the last one seen and acts on the transition. Every
+// trigger source -- route event, ticker, startup -- funnels through here,
+// so it must be cheap and idempotent when nothing has changed.
 func (m *monitor) evaluate(ctx context.Context) {
-	up := interfaceUp(m.iface)
+	up := m.up()
 	switch {
 	case up && !m.wasUp:
 		m.wasUp, m.done, m.attempts = true, false, 0
