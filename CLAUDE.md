@@ -8,6 +8,7 @@ README.md for architecture, install, and usage.
 | Command | Purpose |
 |---------|---------|
 | `make build` | Cross-compile `bin/vpn-kinit` (GOOS=darwin is forced, works on any host) |
+| `make test` | `go test -race` natively (overrides the forced GOOS; runs on any host) |
 | `make check` | `go vet` + golangci-lint (skipped if not installed) |
 | `make install` | Build, install, and (re)bootstrap the LaunchAgent (macOS only) |
 

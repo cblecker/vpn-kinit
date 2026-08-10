@@ -291,6 +291,12 @@ func (m *monitor) evaluate(ctx context.Context) {
 	}
 }
 
+// tryKinit runs kinit if the guards allow it, and records what the
+// resulting ticket is worth. The three guards are deliberately ordered:
+// the attempt cap keeps a hopeless configuration from retrying forever,
+// the cooldown keeps a flapping tunnel from running kinit per event, and
+// the KDC probe costs neither -- a tunnel that is up but not yet routing
+// is the normal case, not a failure to spend attempts on.
 func (m *monitor) tryKinit(ctx context.Context) {
 	if m.attempts >= maxAttempts {
 		return // gave up for this up-period; logged when the cap was hit
@@ -451,6 +457,9 @@ func (m *monitor) kdcReachable() bool {
 	return true
 }
 
+// lookupKDCSRV returns the first KDC advertised for the realm over DNS
+// SRV, or empty if the lookup fails -- which it will until the tunnel
+// carries the realm's DNS, hence the retry on every probe.
 func lookupKDCSRV(realm string) string {
 	_, addrs, err := net.LookupSRV("kerberos", "tcp", realm)
 	if err != nil || len(addrs) == 0 {
@@ -460,6 +469,8 @@ func lookupKDCSRV(realm string) string {
 	return net.JoinHostPort(target, strconv.Itoa(int(addrs[0].Port)))
 }
 
+// withDefaultPort adds the Kerberos port to a bare host, leaving an
+// address that already carries one alone.
 func withDefaultPort(hostport string) string {
 	if _, _, err := net.SplitHostPort(hostport); err == nil {
 		return hostport

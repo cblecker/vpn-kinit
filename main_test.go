@@ -124,6 +124,9 @@ func TestParseFlagsSpellings(t *testing.T) {
 	}
 }
 
+// TestParseFlagsInvalid covers the values that parse but cannot work.
+// The daemon runs unattended under launchd, so a misconfiguration has to
+// fail loudly at startup rather than sit there never firing.
 func TestParseFlagsInvalid(t *testing.T) {
 	tests := []struct {
 		name string
@@ -152,6 +155,9 @@ func TestParseFlagsInvalid(t *testing.T) {
 	}
 }
 
+// TestParseFlagsVersion pins -version as its own outcome rather than an
+// error: main exits zero on it, which is what makes it usable for
+// checking which build launchd actually loaded.
 func TestParseFlagsVersion(t *testing.T) {
 	cfg, _, err := parse(t, "-version")
 	if !errors.Is(err, errVersion) {
@@ -162,6 +168,8 @@ func TestParseFlagsVersion(t *testing.T) {
 	}
 }
 
+// TestParseFlagsHelp covers -h being a success, not a usage error, and
+// checks that usage carries the one thing the flag list cannot describe.
 func TestParseFlagsHelp(t *testing.T) {
 	cfg, out, err := parse(t, "-h")
 	if !errors.Is(err, flag.ErrHelp) {
@@ -179,6 +187,11 @@ func TestParseFlagsHelp(t *testing.T) {
 	}
 }
 
+// TestParseKrb5Conf covers the subset of the krb5.conf format that KDC
+// discovery reads. Everything it gets wrong is silent -- a missed kdc
+// entry just degrades to a DNS SRV lookup, and a malformed one to a probe
+// that never succeeds -- so the cases matter more than the code length
+// suggests.
 func TestParseKrb5Conf(t *testing.T) {
 	tests := []struct {
 		name      string
