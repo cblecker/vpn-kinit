@@ -49,7 +49,7 @@ func TestReadLoop(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer w.Close()
+		defer func() { _ = w.Close() }()
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -87,7 +87,7 @@ func TestReadLoop(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer r.Close()
+		defer func() { _ = r.Close() }()
 
 		notify := make(chan struct{}, 1)
 		done := make(chan error, 1)
