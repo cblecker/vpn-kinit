@@ -15,8 +15,9 @@ re-runs kinit shortly before the ticket expires, so a VPN session that
 outlives the ticket lifetime (say a 36-hour session against 10-hour
 tickets) keeps a valid ticket throughout.
 
-It idles blocked on a kernel routing socket: zero CPU and a couple of
-megabytes of memory.
+It idles blocked on a kernel routing socket, waking only for routing
+changes and a once-a-minute backstop check: negligible CPU and a couple
+of megabytes of memory.
 
 ## Prerequisites
 
@@ -70,9 +71,10 @@ reloads the agent. `make uninstall` removes everything. Stop the
 Homebrew service first if you have one running, so the two copies don't
 both fire.
 
-Other targets: `make build` (cross-compiles for darwin from any host)
-and `make check` (`go vet` + golangci-lint, the latter skipped when
-golangci-lint is not installed).
+Other targets: `make build` (cross-compiles for darwin from any host),
+`make test` (`go test` with the race detector), and `make check`
+(`go vet` + golangci-lint, the latter skipped when golangci-lint is not
+installed).
 
 ## Configuration
 
@@ -88,8 +90,11 @@ array of `LaunchAgents/com.cblecker.vpn-kinit.plist.in`, then re-run
 | `-cooldown`  | `30s`            | Minimum interval between kinit attempts          |
 | `-refresh`   | `1h`             | Re-kinit when the ticket has less than this left (`0` disables) |
 | `-kdc`       | auto             | KDC to probe as `host[:port]`                    |
-| `-debug`     | off              | Debug logging (including failed KDC probes)      |
+| `-debug`     | off              | Debug logging (failed KDC probes and ticket reads) |
 | `-version`   | —                | Print the version and exit                       |
+
+`-refresh` and `-cooldown` take Go durations (`30s`, `10m`, `2h`); a
+negative value is rejected at startup with exit status 2.
 
 `vpn-kinit -h` prints the same list; the running version is also in the
 `vpn-kinit started` log line, which is the quickest way to tell which
@@ -173,9 +178,12 @@ Both install methods send stdout and stderr to the same file. Logged at
 the default level: startup (with the interface and kinit path), which
 KDC was discovered and from where, every interface up/down transition,
 ticket refreshes, and every kinit attempt — failures include the
-attempt number and kinit's combined output. Add `-debug` to also log KDC probe failures,
-which is the case to look at when the interface comes up but kinit
-never runs.
+attempt number and kinit's combined output.
+
+Add `-debug` to also log the two checks that are silent by design: failed
+KDC probes, which is what to look at when the interface comes up but
+kinit never runs, and failed or unparseable `klist` reads, which is what
+to look at when kinit runs but the ticket is never refreshed.
 
 Since the Homebrew service takes no flags, the way to get debug output
 from a Homebrew install is to stop the service and run it in the
@@ -199,5 +207,7 @@ The explicit path matters if you also have a source install: a bare
 - kinit failing with the tunnel up usually means no Keychain password
   item — run `kinit` once interactively. Note this must run as a
   LaunchAgent (not a LaunchDaemon) to access the login Keychain.
-- Building on non-macOS hosts: the code is darwin-only; use
-  `GOOS=darwin go build` (the Makefile does this automatically).
+- Building on non-macOS hosts: the binary is darwin-only; use
+  `GOOS=darwin go build` (the Makefile does this automatically). The
+  tests are not — `make test` runs the portable code on any host, with a
+  stub standing in for the route monitor.

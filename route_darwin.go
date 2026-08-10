@@ -73,6 +73,12 @@ func routeListen(ctx context.Context, notify chan<- struct{}, log *slog.Logger) 
 	}
 }
 
+// readLoop pokes for every route message until the socket fails,
+// returning the error that ended it so the caller can reopen. A poke is
+// not a delivered notification: bursts coalesce in the capacity-1
+// channel, which is the point -- one re-evaluation answers a burst as
+// well as many would. A read interrupted by ctx being cancelled is a
+// clean shutdown, not a failure.
 func readLoop(ctx context.Context, f *os.File, notify chan<- struct{}) error {
 	buf := make([]byte, readBufSize)
 	for {
@@ -93,6 +99,9 @@ func readLoop(ctx context.Context, f *os.File, notify chan<- struct{}) error {
 	}
 }
 
+// poke signals that something changed, without ever blocking: route
+// messages arrive in bursts, and one pending re-evaluation answers all of
+// them just as well as a queue would.
 func poke(ch chan<- struct{}) {
 	select {
 	case ch <- struct{}{}:
@@ -100,6 +109,9 @@ func poke(ch chan<- struct{}) {
 	}
 }
 
+// sleepCtx waits for d, reporting true if it elapsed and false if ctx was
+// cancelled first -- so a caller backing off can tell "try again" from
+// "we are shutting down".
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	select {
 	case <-ctx.Done():

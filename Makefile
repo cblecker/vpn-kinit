@@ -12,7 +12,7 @@ export CGO_ENABLED := 0
 
 GOLANGCI_LINT ?= golangci-lint
 
-.PHONY: all build vet lint check install uninstall clean
+.PHONY: all build vet lint test check install uninstall clean
 
 all: build
 
@@ -21,6 +21,15 @@ build:
 
 vet:
 	go vet ./...
+
+# Tests have to run natively, so this target overrides the darwin GOOS
+# the rest of the Makefile exports; -race additionally needs the cgo that
+# the release build turns off. The darwin-only files are excluded by their
+# build tags; route_other.go stands in for them.
+test: GOOS := $(shell go env GOHOSTOS)
+test: CGO_ENABLED := 1
+test:
+	go test -race ./...
 
 # `make check` is a local convenience; CI never calls it and enforces all of
 # this itself, through golangci-lint-action and `go test`. So a missing

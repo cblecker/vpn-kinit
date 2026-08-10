@@ -124,6 +124,9 @@ func TestParseFlagsSpellings(t *testing.T) {
 	}
 }
 
+// TestParseFlagsInvalid covers the values that parse but cannot work.
+// The daemon runs unattended under launchd, so a misconfiguration has to
+// fail loudly at startup rather than sit there never firing.
 func TestParseFlagsInvalid(t *testing.T) {
 	tests := []struct {
 		name string
@@ -152,6 +155,9 @@ func TestParseFlagsInvalid(t *testing.T) {
 	}
 }
 
+// TestParseFlagsVersion pins -version as its own outcome rather than an
+// error: main exits zero on it, which is what makes it usable for
+// checking which build launchd actually loaded.
 func TestParseFlagsVersion(t *testing.T) {
 	cfg, _, err := parse(t, "-version")
 	if !errors.Is(err, errVersion) {
@@ -162,6 +168,8 @@ func TestParseFlagsVersion(t *testing.T) {
 	}
 }
 
+// TestParseFlagsHelp covers -h being a success, not a usage error, and
+// checks that usage carries the one thing the flag list cannot describe.
 func TestParseFlagsHelp(t *testing.T) {
 	cfg, out, err := parse(t, "-h")
 	if !errors.Is(err, flag.ErrHelp) {
@@ -179,6 +187,11 @@ func TestParseFlagsHelp(t *testing.T) {
 	}
 }
 
+// TestParseKrb5Conf covers the subset of the krb5.conf format that KDC
+// discovery reads. Everything it gets wrong is silent -- a missed kdc
+// entry just degrades to a DNS SRV lookup, and a malformed one to a probe
+// that never succeeds -- so the cases matter more than the code length
+// suggests.
 func TestParseKrb5Conf(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -246,6 +259,128 @@ func TestParseKrb5Conf(t *testing.T) {
 	default_realm = EXAMPLE.COM
 `,
 			wantRealm: "EXAMPLE.COM",
+		},
+		{
+			// A closing brace sharing the last entry's line must not end
+			// up inside the value: "kdc.example.com }" would be probed
+			// as a hostname, failing forever.
+			name: "a closing brace after the last entry",
+			conf: `[libdefaults]
+	default_realm = EXAMPLE.COM
+
+[realms]
+	EXAMPLE.COM = {
+		kdc = kdc.example.com }
+`,
+			wantRealm: "EXAMPLE.COM",
+			wantKDCs:  []string{"kdc.example.com"},
+		},
+		{
+			name: "a realm block on one line",
+			conf: `[libdefaults]
+	default_realm = EXAMPLE.COM
+
+[realms]
+	EXAMPLE.COM = { kdc = kdc.example.com }
+	OTHER.COM = { kdc = kdc.other.com }
+`,
+			wantRealm: "EXAMPLE.COM",
+			wantKDCs:  []string{"kdc.example.com"},
+		},
+		{
+			name: "section names are case-insensitive",
+			conf: `[LibDefaults]
+	Default_Realm = EXAMPLE.COM
+
+[Realms]
+	EXAMPLE.COM = {
+		KDC = kdc.example.com
+	}
+`,
+			wantRealm: "EXAMPLE.COM",
+			wantKDCs:  []string{"kdc.example.com"},
+		},
+		{
+			// Realm names are case-sensitive in Kerberos, so a block
+			// whose name differs in case is a different realm.
+			name: "a realm block in the wrong case is not the default realm",
+			conf: `[libdefaults]
+	default_realm = EXAMPLE.COM
+
+[realms]
+	example.com = {
+		kdc = kdc.example.com
+	}
+`,
+			wantRealm: "EXAMPLE.COM",
+		},
+		{
+			name: "an unclosed realm block still yields its kdcs",
+			conf: `[libdefaults]
+	default_realm = EXAMPLE.COM
+
+[realms]
+	EXAMPLE.COM = {
+		kdc = kdc.example.com
+`,
+			wantRealm: "EXAMPLE.COM",
+			wantKDCs:  []string{"kdc.example.com"},
+		},
+		{
+			name: "the last default_realm wins",
+			conf: `[libdefaults]
+	default_realm = FIRST.COM
+	default_realm = SECOND.COM
+
+[realms]
+	FIRST.COM = {
+		kdc = kdc.first.com
+	}
+	SECOND.COM = {
+		kdc = kdc.second.com
+	}
+`,
+			wantRealm: "SECOND.COM",
+			wantKDCs:  []string{"kdc.second.com"},
+		},
+		{
+			// Only one level of nesting is understood, so a sub-block's
+			// closing brace ends the realm early and any kdc after it is
+			// missed. Harmless in practice -- only the first kdc is ever
+			// probed, and it precedes the sub-block in any realistic
+			// config -- but pinned here so the limitation is visible.
+			name: "a nested sub-block ends the realm early",
+			conf: `[libdefaults]
+	default_realm = EXAMPLE.COM
+
+[realms]
+	EXAMPLE.COM = {
+		kdc = kdc.example.com
+		v4_instance_convert = {
+			mail = example.com
+		}
+		kdc = missed.example.com
+	}
+`,
+			wantRealm: "EXAMPLE.COM",
+			wantKDCs:  []string{"kdc.example.com"},
+		},
+		{
+			// Not following includes is a documented limitation; the
+			// directive must at least not confuse the parser.
+			name: "includedir is ignored, not followed",
+			conf: `includedir /etc/krb5.conf.d/
+
+[libdefaults]
+	default_realm = EXAMPLE.COM
+
+[realms]
+	EXAMPLE.COM = {
+		kdc = kdc.example.com
+	}
+`,
+			wantRealm: "EXAMPLE.COM",
+			wantKDCs:  []string{"kdc.example.com"},
 		},
 		{
 			name: "empty file",

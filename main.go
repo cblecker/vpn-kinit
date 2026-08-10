@@ -33,13 +33,16 @@ import (
 // plain `go build` leaves it at "dev".
 var version = "dev"
 
+// krb5ConfPath is where KDC discovery looks for the Kerberos
+// configuration. A variable so tests can point it at a fixture.
+var krb5ConfPath = "/etc/krb5.conf"
+
 const (
 	tickerInterval = 60 * time.Second // backstop for missed route events (e.g. across sleep/wake)
 	kinitTimeout   = 30 * time.Second
 	probeTimeout   = 3 * time.Second
 	klistTimeout   = 5 * time.Second
 	maxAttempts    = 10 // kinit attempts per up-transition
-	krb5ConfPath   = "/etc/krb5.conf"
 	kerberosPort   = "88"
 
 	// klistTimestamp is the timestamp layout in `klist --json` output,
@@ -197,6 +200,12 @@ type monitor struct {
 	realm     string        // for lazy DNS SRV discovery when kdc is empty
 	log       *slog.Logger
 
+	// ifaceUp reports whether iface is up. Nil, outside tests, means ask
+	// the kernel: the interface is the one input with no path through the
+	// fields above, and faking a tunnel coming and going is the only way
+	// to drive the transitions in evaluate.
+	ifaceUp func(string) bool
+
 	wasUp       bool
 	done        bool      // kinit succeeded for the current up-period
 	attempts    int       // kinit attempts in the current up-period
@@ -233,13 +242,29 @@ func (m *monitor) discoverKDC(flagVal string) {
 	m.log.Warn("no KDC discovered; kinit will run without a reachability probe")
 }
 
+// interfaceUp reports whether the named interface exists and is up. A
+// missing interface is not an error here: NetBird's utun only exists
+// while the tunnel does, so "no such interface" is the normal down state.
 func interfaceUp(name string) bool {
 	ifi, err := net.InterfaceByName(name)
 	return err == nil && ifi.Flags&net.FlagUp != 0
 }
 
+// up reports whether the watched interface is up, through the ifaceUp
+// seam when one is installed.
+func (m *monitor) up() bool {
+	if m.ifaceUp != nil {
+		return m.ifaceUp(m.iface)
+	}
+	return interfaceUp(m.iface)
+}
+
+// evaluate runs the edge detection: it compares the interface's current
+// state against the last one seen and acts on the transition. Every
+// trigger source -- route event, ticker, startup -- funnels through here,
+// so it must be cheap and idempotent when nothing has changed.
 func (m *monitor) evaluate(ctx context.Context) {
-	up := interfaceUp(m.iface)
+	up := m.up()
 	switch {
 	case up && !m.wasUp:
 		m.wasUp, m.done, m.attempts = true, false, 0
@@ -266,6 +291,12 @@ func (m *monitor) evaluate(ctx context.Context) {
 	}
 }
 
+// tryKinit runs kinit if the guards allow it, and records what the
+// resulting ticket is worth. The three guards are deliberately ordered:
+// the attempt cap keeps a hopeless configuration from retrying forever,
+// the cooldown keeps a flapping tunnel from running kinit per event, and
+// the KDC probe costs neither -- a tunnel that is up but not yet routing
+// is the normal case, not a failure to spend attempts on.
 func (m *monitor) tryKinit(ctx context.Context) {
 	if m.attempts >= maxAttempts {
 		return // gave up for this up-period; logged when the cap was hit
@@ -426,6 +457,9 @@ func (m *monitor) kdcReachable() bool {
 	return true
 }
 
+// lookupKDCSRV returns the first KDC advertised for the realm over DNS
+// SRV, or empty if the lookup fails -- which it will until the tunnel
+// carries the realm's DNS, hence the retry on every probe.
 func lookupKDCSRV(realm string) string {
 	_, addrs, err := net.LookupSRV("kerberos", "tcp", realm)
 	if err != nil || len(addrs) == 0 {
@@ -435,6 +469,8 @@ func lookupKDCSRV(realm string) string {
 	return net.JoinHostPort(target, strconv.Itoa(int(addrs[0].Port)))
 }
 
+// withDefaultPort adds the Kerberos port to a bare host, leaving an
+// address that already carries one alone.
 func withDefaultPort(hostport string) string {
 	if _, _, err := net.SplitHostPort(hostport); err == nil {
 		return hostport
@@ -445,7 +481,9 @@ func withDefaultPort(hostport string) string {
 // parseKrb5Conf extracts default_realm and that realm's kdc entries.
 // It understands just enough of the krb5.conf format for this purpose:
 // comments, [section] headers, key = value lines, and one level of
-// braced realm blocks. include/includedir directives are not followed.
+// braced realm blocks. Braces are read wherever they fall on a line, so
+// both the conventional layout and a realm written entirely on one line
+// parse. include/includedir directives are not followed.
 func parseKrb5Conf(path string) (realm string, kdcs []string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -465,25 +503,48 @@ func parseKrb5Conf(path string) (realm string, kdcs []string) {
 			section, curRealm = strings.ToLower(line[1:len(line)-1]), ""
 			continue
 		}
-		key, value, ok := strings.Cut(line, "=")
-		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
 		switch section {
 		case "libdefaults":
-			if ok && strings.EqualFold(key, "default_realm") {
-				realm = value
+			if key, value, ok := strings.Cut(line, "="); ok && strings.EqualFold(strings.TrimSpace(key), "default_realm") {
+				realm = strings.TrimSpace(value)
 			}
 		case "realms":
-			switch {
-			case curRealm == "":
-				if ok && value == "{" {
-					curRealm = key
-				}
-			case line == "}":
-				curRealm = ""
-			case ok && strings.EqualFold(key, "kdc"):
-				realmKDCs[curRealm] = append(realmKDCs[curRealm], value)
-			}
+			curRealm = parseRealmLine(line, curRealm, realmKDCs)
 		}
 	}
 	return realm, realmKDCs[realm]
+}
+
+// parseRealmLine reads one line of the [realms] section, given the realm
+// block currently open (empty for none), and returns the block still open
+// after it. Opening and closing braces are found by position rather than
+// by matching the whole line, so a block written as
+//
+//	EXAMPLE.COM = { kdc = kdc.example.com }
+//
+// yields the same kdc as the conventional multi-line spelling -- and a
+// closing brace trailing the last entry does not end up inside its value.
+func parseRealmLine(line, curRealm string, realmKDCs map[string][]string) string {
+	for line != "" {
+		if curRealm == "" {
+			key, rest, ok := strings.Cut(line, "=")
+			rest = strings.TrimSpace(rest)
+			if !ok || !strings.HasPrefix(rest, "{") {
+				return "" // not a realm block opener; nothing else on this line can be one
+			}
+			curRealm = strings.TrimSpace(key)
+			line = strings.TrimSpace(rest[1:])
+			continue
+		}
+		entry, rest, closed := strings.Cut(line, "}")
+		if key, value, ok := strings.Cut(entry, "="); ok && strings.EqualFold(strings.TrimSpace(key), "kdc") {
+			realmKDCs[curRealm] = append(realmKDCs[curRealm], strings.TrimSpace(value))
+		}
+		if !closed {
+			return curRealm
+		}
+		// The block ended; anything after the brace starts a new one.
+		curRealm, line = "", strings.TrimSpace(rest)
+	}
+	return curRealm
 }
