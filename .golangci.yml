@@ -1,0 +1,74 @@
+version: "2"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+    - gofumpt
+
+linters:
+  # linters.default is "standard": errcheck, govet, ineffassign, staticcheck,
+  # unused. Everything below is additive.
+  enable:
+    # correctness
+    - asasalint
+    - bidichk
+    - contextcheck
+    - durationcheck
+    - errname
+    - errorlint
+    - fatcontext
+    - forcetypeassert
+    - gocheckcompilerdirectives
+    - musttag
+    - nilnesserr
+    - recvcheck
+
+    # simplification
+    - gocritic
+    - modernize
+    - perfsprint
+    - revive
+    - unconvert
+    - unparam
+
+    # consistency
+    - dupword
+    - gochecknoinits
+    - godot
+    - goprintffuncname
+    - misspell
+    - nakedret
+    - nolintlint
+    - nosprintfhostport
+    - sloglint
+
+    # tests
+    - thelper
+    - usetesting
+
+  settings:
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+        - style
+
+    # The daemon logs exclusively through slog, in bare key-value pairs with a
+    # constant message and the details in the attributes.
+    sloglint:
+      kv-only: true
+      static-msg: true
+      key-naming-case: snake
+
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+
+issues:
+  # Defaults hide findings: uniq-by-line keeps only the first issue on a line
+  # (a gofmt hit is easily masked by another linter landing on the same line),
+  # and the max-issues caps silently truncate the report.
+  uniq-by-line: false
+  max-issues-per-linter: 0
+  max-same-issues: 0

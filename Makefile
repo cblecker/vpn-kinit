@@ -10,7 +10,9 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 export GOOS        := darwin
 export CGO_ENABLED := 0
 
-.PHONY: all build vet check install uninstall clean
+GOLANGCI_LINT ?= golangci-lint
+
+.PHONY: all build vet fmt lint check install uninstall clean
 
 all: build
 
@@ -20,8 +22,19 @@ build:
 vet:
 	go vet ./...
 
-check: vet
+# gofmt is also enforced by the gofmt formatter in .golangci.yml; this target
+# repeats it so `make check` catches unformatted code with no extra tooling.
+fmt:
 	@test -z "$$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+# CI runs golangci-lint via golangci-lint-action, so a missing local binary is
+# a skip rather than a failure.
+lint:
+	@command -v $(GOLANGCI_LINT) >/dev/null || \
+	    { echo "$(GOLANGCI_LINT) not installed, skipping"; exit 0; }; \
+	  $(GOLANGCI_LINT) config verify && $(GOLANGCI_LINT) run ./...
+
+check: vet fmt lint
 
 install: build
 	@test "$$(uname -s)" = "Darwin" || (echo "install must run on macOS" && exit 1)
