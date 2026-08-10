@@ -248,6 +248,128 @@ func TestParseKrb5Conf(t *testing.T) {
 			wantRealm: "EXAMPLE.COM",
 		},
 		{
+			// A closing brace sharing the last entry's line must not end
+			// up inside the value: "kdc.example.com }" would be probed
+			// as a hostname, failing forever.
+			name: "a closing brace after the last entry",
+			conf: `[libdefaults]
+	default_realm = EXAMPLE.COM
+
+[realms]
+	EXAMPLE.COM = {
+		kdc = kdc.example.com }
+`,
+			wantRealm: "EXAMPLE.COM",
+			wantKDCs:  []string{"kdc.example.com"},
+		},
+		{
+			name: "a realm block on one line",
+			conf: `[libdefaults]
+	default_realm = EXAMPLE.COM
+
+[realms]
+	EXAMPLE.COM = { kdc = kdc.example.com }
+	OTHER.COM = { kdc = kdc.other.com }
+`,
+			wantRealm: "EXAMPLE.COM",
+			wantKDCs:  []string{"kdc.example.com"},
+		},
+		{
+			name: "section names are case-insensitive",
+			conf: `[LibDefaults]
+	Default_Realm = EXAMPLE.COM
+
+[Realms]
+	EXAMPLE.COM = {
+		KDC = kdc.example.com
+	}
+`,
+			wantRealm: "EXAMPLE.COM",
+			wantKDCs:  []string{"kdc.example.com"},
+		},
+		{
+			// Realm names are case-sensitive in Kerberos, so a block
+			// whose name differs in case is a different realm.
+			name: "a realm block in the wrong case is not the default realm",
+			conf: `[libdefaults]
+	default_realm = EXAMPLE.COM
+
+[realms]
+	example.com = {
+		kdc = kdc.example.com
+	}
+`,
+			wantRealm: "EXAMPLE.COM",
+		},
+		{
+			name: "an unclosed realm block still yields its kdcs",
+			conf: `[libdefaults]
+	default_realm = EXAMPLE.COM
+
+[realms]
+	EXAMPLE.COM = {
+		kdc = kdc.example.com
+`,
+			wantRealm: "EXAMPLE.COM",
+			wantKDCs:  []string{"kdc.example.com"},
+		},
+		{
+			name: "the last default_realm wins",
+			conf: `[libdefaults]
+	default_realm = FIRST.COM
+	default_realm = SECOND.COM
+
+[realms]
+	FIRST.COM = {
+		kdc = kdc.first.com
+	}
+	SECOND.COM = {
+		kdc = kdc.second.com
+	}
+`,
+			wantRealm: "SECOND.COM",
+			wantKDCs:  []string{"kdc.second.com"},
+		},
+		{
+			// Only one level of nesting is understood, so a sub-block's
+			// closing brace ends the realm early and any kdc after it is
+			// missed. Harmless in practice -- only the first kdc is ever
+			// probed, and it precedes the sub-block in any realistic
+			// config -- but pinned here so the limitation is visible.
+			name: "a nested sub-block ends the realm early",
+			conf: `[libdefaults]
+	default_realm = EXAMPLE.COM
+
+[realms]
+	EXAMPLE.COM = {
+		kdc = kdc.example.com
+		v4_instance_convert = {
+			mail = example.com
+		}
+		kdc = missed.example.com
+	}
+`,
+			wantRealm: "EXAMPLE.COM",
+			wantKDCs:  []string{"kdc.example.com"},
+		},
+		{
+			// Not following includes is a documented limitation; the
+			// directive must at least not confuse the parser.
+			name: "includedir is ignored, not followed",
+			conf: `includedir /etc/krb5.conf.d/
+
+[libdefaults]
+	default_realm = EXAMPLE.COM
+
+[realms]
+	EXAMPLE.COM = {
+		kdc = kdc.example.com
+	}
+`,
+			wantRealm: "EXAMPLE.COM",
+			wantKDCs:  []string{"kdc.example.com"},
+		},
+		{
 			name: "empty file",
 		},
 	}

@@ -470,7 +470,9 @@ func withDefaultPort(hostport string) string {
 // parseKrb5Conf extracts default_realm and that realm's kdc entries.
 // It understands just enough of the krb5.conf format for this purpose:
 // comments, [section] headers, key = value lines, and one level of
-// braced realm blocks. include/includedir directives are not followed.
+// braced realm blocks. Braces are read wherever they fall on a line, so
+// both the conventional layout and a realm written entirely on one line
+// parse. include/includedir directives are not followed.
 func parseKrb5Conf(path string) (realm string, kdcs []string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -490,25 +492,48 @@ func parseKrb5Conf(path string) (realm string, kdcs []string) {
 			section, curRealm = strings.ToLower(line[1:len(line)-1]), ""
 			continue
 		}
-		key, value, ok := strings.Cut(line, "=")
-		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
 		switch section {
 		case "libdefaults":
-			if ok && strings.EqualFold(key, "default_realm") {
-				realm = value
+			if key, value, ok := strings.Cut(line, "="); ok && strings.EqualFold(strings.TrimSpace(key), "default_realm") {
+				realm = strings.TrimSpace(value)
 			}
 		case "realms":
-			switch {
-			case curRealm == "":
-				if ok && value == "{" {
-					curRealm = key
-				}
-			case line == "}":
-				curRealm = ""
-			case ok && strings.EqualFold(key, "kdc"):
-				realmKDCs[curRealm] = append(realmKDCs[curRealm], value)
-			}
+			curRealm = parseRealmLine(line, curRealm, realmKDCs)
 		}
 	}
 	return realm, realmKDCs[realm]
+}
+
+// parseRealmLine reads one line of the [realms] section, given the realm
+// block currently open (empty for none), and returns the block still open
+// after it. Opening and closing braces are found by position rather than
+// by matching the whole line, so a block written as
+//
+//	EXAMPLE.COM = { kdc = kdc.example.com }
+//
+// yields the same kdc as the conventional multi-line spelling -- and a
+// closing brace trailing the last entry does not end up inside its value.
+func parseRealmLine(line, curRealm string, realmKDCs map[string][]string) string {
+	for line != "" {
+		if curRealm == "" {
+			key, rest, ok := strings.Cut(line, "=")
+			rest = strings.TrimSpace(rest)
+			if !ok || !strings.HasPrefix(rest, "{") {
+				return "" // not a realm block opener; nothing else on this line can be one
+			}
+			curRealm = strings.TrimSpace(key)
+			line = strings.TrimSpace(rest[1:])
+			continue
+		}
+		entry, rest, closed := strings.Cut(line, "}")
+		if key, value, ok := strings.Cut(entry, "="); ok && strings.EqualFold(strings.TrimSpace(key), "kdc") {
+			realmKDCs[curRealm] = append(realmKDCs[curRealm], strings.TrimSpace(value))
+		}
+		if !closed {
+			return curRealm
+		}
+		// The block ended; anything after the brace starts a new one.
+		curRealm, line = "", strings.TrimSpace(rest)
+	}
+	return curRealm
 }
