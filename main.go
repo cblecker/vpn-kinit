@@ -15,6 +15,8 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -26,6 +28,10 @@ import (
 	"syscall"
 	"time"
 )
+
+// version is stamped at build time with -ldflags "-X main.version=...";
+// plain `go build` leaves it at "dev".
+var version = "dev"
 
 const (
 	tickerInterval = 60 * time.Second // backstop for missed route events (e.g. across sleep/wake)
@@ -47,43 +53,116 @@ const (
 	fallbackLifetime = 8 * time.Hour
 )
 
+// config is the parsed command line.
+type config struct {
+	iface     string
+	kinit     string
+	kdc       string
+	cooldown  time.Duration
+	refresh   time.Duration
+	debug     bool
+	kinitArgs []string // anything after "--", passed through to kinit
+}
+
+// errVersion is returned by parseFlags for -version, which prints the
+// version and exits successfully rather than starting the daemon.
+var errVersion = errors.New("version requested")
+
+// parseFlags parses args into a config. It writes its own diagnostics
+// (bad flags, invalid values, usage) to out, the way flag.FlagSet does,
+// so callers only need the error for the exit status. Every error but
+// errVersion means the daemon should not start.
+func parseFlags(name string, args []string, out io.Writer) (*config, error) {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(out)
+
+	var cfg config
+	fs.StringVar(&cfg.iface, "interface", defaultInterface, "tunnel interface to watch")
+	fs.StringVar(&cfg.kinit, "kinit", "/usr/bin/kinit", "path to kinit")
+	fs.DurationVar(&cfg.cooldown, "cooldown", 30*time.Second, "minimum interval between kinit attempts")
+	fs.DurationVar(&cfg.refresh, "refresh", time.Hour, "re-run kinit when the ticket has less than this left (0 disables refresh)")
+	fs.StringVar(&cfg.kdc, "kdc", "", "KDC to probe for reachability as host[:port] (default: auto-discover from /etc/krb5.conf or DNS SRV)")
+	fs.BoolVar(&cfg.debug, "debug", false, "enable debug logging")
+	showVersion := fs.Bool("version", false, "print the version and exit")
+
+	fs.Usage = func() {
+		fmt.Fprintf(out, "Usage: %s [flags] [-- kinit args...]\n\n", name)
+		fmt.Fprint(out, "Runs kinit when the VPN tunnel interface comes up, and again\n"+
+			"shortly before the ticket expires while it stays up.\n\nFlags:\n")
+		fs.PrintDefaults()
+		fmt.Fprintf(out, "\nArguments after -- are passed through to kinit, e.g.\n"+
+			"  %s -- -kt /path/to/keytab user@REALM\n", name)
+	}
+
+	if err := fs.Parse(args); err != nil {
+		return nil, err // flag has already reported it to out
+	}
+	if *showVersion {
+		return nil, errVersion
+	}
+	// Negative durations parse fine but are meaningless here: a negative
+	// refresh would never fire and a negative cooldown would disable the
+	// rate limit, both silently.
+	if cfg.refresh < 0 {
+		return nil, flagErrorf(fs, out, "-refresh must be zero or positive, got %s", cfg.refresh)
+	}
+	if cfg.cooldown < 0 {
+		return nil, flagErrorf(fs, out, "-cooldown must be zero or positive, got %s", cfg.cooldown)
+	}
+	cfg.kinitArgs = fs.Args()
+	return &cfg, nil
+}
+
+// flagErrorf reports an invalid flag value the way flag.FlagSet reports a
+// parse error: the message, then usage.
+func flagErrorf(fs *flag.FlagSet, out io.Writer, format string, args ...any) error {
+	err := fmt.Errorf(format, args...)
+	fmt.Fprintln(out, err)
+	fs.Usage()
+	return err
+}
+
 func main() {
-	ifaceName := flag.String("interface", defaultInterface, "tunnel interface to watch")
-	kinitPath := flag.String("kinit", "/usr/bin/kinit", "path to kinit")
-	cooldown := flag.Duration("cooldown", 30*time.Second, "minimum interval between kinit attempts")
-	refresh := flag.Duration("refresh", time.Hour, "re-run kinit when the ticket has less than this left (0 disables refresh)")
-	kdcFlag := flag.String("kdc", "", "KDC to probe for reachability as host[:port] (default: auto-discover from /etc/krb5.conf or DNS SRV)")
-	debug := flag.Bool("debug", false, "enable debug logging")
-	flag.Parse()
+	cfg, err := parseFlags(filepath.Base(os.Args[0]), os.Args[1:], os.Stderr)
+	switch {
+	case errors.Is(err, errVersion):
+		fmt.Println("vpn-kinit", version)
+		return
+	case errors.Is(err, flag.ErrHelp):
+		return
+	case err != nil:
+		os.Exit(2)
+	}
 
 	level := slog.LevelInfo
-	if *debug {
+	if cfg.debug {
 		level = slog.LevelDebug
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
-	if *refresh < 0 {
-		log.Error("-refresh must be zero or positive", "refresh", *refresh)
-		os.Exit(2)
-	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	run(ctx, cfg, log)
+}
+
+// run drives the monitor until ctx is cancelled.
+func run(ctx context.Context, cfg *config, log *slog.Logger) {
 	m := &monitor{
-		iface:     *ifaceName,
-		kinit:     *kinitPath,
-		kinitArgs: flag.Args(), // anything after "--" is passed to kinit
-		cooldown:  *cooldown,
-		refresh:   *refresh,
-		klist:     filepath.Join(filepath.Dir(*kinitPath), "klist"),
+		iface:     cfg.iface,
+		kinit:     cfg.kinit,
+		kinitArgs: cfg.kinitArgs,
+		cooldown:  cfg.cooldown,
+		refresh:   cfg.refresh,
+		klist:     filepath.Join(filepath.Dir(cfg.kinit), "klist"),
 		log:       log,
 	}
-	m.discoverKDC(*kdcFlag)
+	m.discoverKDC(cfg.kdc)
 
 	events := make(chan struct{}, 1) // capacity 1: bursts coalesce
 	go routeListen(ctx, events, log)
 
-	log.Info("vpn-kinit started", "interface", m.iface, "kinit", m.kinit)
+	log.Info("vpn-kinit started", "version", version, "interface", m.iface, "kinit", m.kinit)
 	m.evaluate(ctx) // interface may already be up at startup
 
 	ticker := time.NewTicker(tickerInterval)
