@@ -10,7 +10,10 @@ connects. vpn-kinit fills that gap: it watches for the NetBird WireGuard
 interface (`utun100` by default) to appear, waits until the KDC is
 actually reachable through the tunnel, and then runs `/usr/bin/kinit` —
 which on macOS acquires tickets using the password stored in the login
-Keychain (per `/etc/krb5.conf`).
+Keychain (per `/etc/krb5.conf`). While the tunnel stays up it also
+re-runs kinit shortly before the ticket expires, so a VPN session that
+outlives the ticket lifetime (say a 36-hour session against 10-hour
+tickets) keeps a valid ticket throughout.
 
 It idles blocked on a kernel routing socket: zero CPU and a couple of
 megabytes of memory.
@@ -82,6 +85,7 @@ array of `LaunchAgents/com.cblecker.vpn-kinit.plist.in`, then re-run
 | `-interface` | `utun100`        | Tunnel interface to watch                        |
 | `-kinit`     | `/usr/bin/kinit` | Path to kinit                                    |
 | `-cooldown`  | `30s`            | Minimum interval between kinit attempts          |
+| `-refresh`   | `1h`             | Re-kinit when the ticket has less than this left (`0` disables) |
 | `-kdc`       | auto             | KDC to probe as `host[:port]`                    |
 | `-debug`     | off              | Debug logging (including failed KDC probes)      |
 
@@ -113,16 +117,29 @@ On each trigger it checks whether the interface exists and is up. On a
 down→up transition it probes the KDC over TCP (port 88) and, once
 reachable, runs `kinit`. A failed kinit is retried on later triggers
 (at most 10 attempts per connect, rate-limited by `-cooldown`); failed
-KDC probes are free and never count as attempts. Nothing runs again
-until the tunnel goes down and comes back up.
+KDC probes are free and never count as attempts. With refresh disabled
+(`-refresh 0`), nothing runs again until the tunnel goes down and
+comes back up.
 
 Route messages are never parsed — they are only a hint to re-check
 interface state — so kernel-dropped or truncated messages are
 harmless. If the routing socket fails it is reopened automatically.
 
-Known limitation: vpn-kinit is edge-triggered, so a VPN session that
-outlives the ticket lifetime gets no automatic re-kinit. A possible
-future enhancement is subscribing to the NetBird daemon's
+While the tunnel stays up, vpn-kinit also watches the ticket itself:
+it reads the TGT expiry via `klist --json` (klist is looked for next
+to the configured kinit) and starts a fresh kinit round once less than
+`-refresh` remains. The same check runs on startup and reconnect, so
+an up-transition that finds a still-fresh ticket — a daemon restart, a
+brief VPN flap, a manual `kinit` — does not burn a needless kinit. A
+`-refresh` margin that would exceed the ticket lifetime is capped at
+half the lifetime, and if the expiry can't be read at all, refreshes
+fall back to assuming an 8-hour lifetime. `-refresh 0` disables all of
+this and restores purely edge-triggered behavior. Expiry timestamps
+are interpreted as local time (matching what plain `klist` displays);
+a fresh ticket whose issue time reads far from "now" is logged as a
+warning, since that would mean refresh timing is skewed.
+
+A possible future enhancement is subscribing to the NetBird daemon's
 `SubscribeStatus` gRPC stream for exact connection-state semantics,
 at the cost of depending on NetBird's internal API.
 
@@ -149,8 +166,8 @@ tail -f ~/Library/Logs/vpn-kinit.log
 Both install methods send stdout and stderr to the same file. Logged at
 the default level: startup (with the interface and kinit path), which
 KDC was discovered and from where, every interface up/down transition,
-and every kinit attempt — failures include the attempt number and
-kinit's combined output. Add `-debug` to also log KDC probe failures,
+ticket refreshes, and every kinit attempt — failures include the
+attempt number and kinit's combined output. Add `-debug` to also log KDC probe failures,
 which is the case to look at when the interface comes up but kinit
 never runs.
 
