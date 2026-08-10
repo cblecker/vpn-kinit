@@ -85,12 +85,15 @@ func parseFlags(name string, args []string, out io.Writer) (*config, error) {
 	fs.BoolVar(&cfg.debug, "debug", false, "enable debug logging")
 	showVersion := fs.Bool("version", false, "print the version and exit")
 
+	// Write errors are dropped throughout: usage goes to a stream we are
+	// about to exit on, and there is nowhere left to report a failure to.
+	// flag's own PrintDefaults does the same.
 	fs.Usage = func() {
-		fmt.Fprintf(out, "Usage: %s [flags] [-- kinit args...]\n\n", name)
-		fmt.Fprint(out, "Runs kinit when the VPN tunnel interface comes up, and again\n"+
-			"shortly before the ticket expires while it stays up.\n\nFlags:\n")
+		_, _ = fmt.Fprintf(out, "Usage: %s [flags] [-- kinit args...]\n\n"+
+			"Runs kinit when the VPN tunnel interface comes up, and again\n"+
+			"shortly before the ticket expires while it stays up.\n\nFlags:\n", name)
 		fs.PrintDefaults()
-		fmt.Fprintf(out, "\nArguments after -- are passed through to kinit, e.g.\n"+
+		_, _ = fmt.Fprintf(out, "\nArguments after -- are passed through to kinit, e.g.\n"+
 			"  %s -- -kt /path/to/keytab user@REALM\n", name)
 	}
 
@@ -117,16 +120,17 @@ func parseFlags(name string, args []string, out io.Writer) (*config, error) {
 // parse error: the message, then usage.
 func flagErrorf(fs *flag.FlagSet, out io.Writer, format string, args ...any) error {
 	err := fmt.Errorf(format, args...)
-	fmt.Fprintln(out, err)
+	_, _ = fmt.Fprintln(out, err)
 	fs.Usage()
 	return err
 }
 
 func main() {
-	cfg, err := parseFlags(filepath.Base(os.Args[0]), os.Args[1:], os.Stderr)
+	name := filepath.Base(os.Args[0])
+	cfg, err := parseFlags(name, os.Args[1:], os.Stderr)
 	switch {
 	case errors.Is(err, errVersion):
-		fmt.Println("vpn-kinit", version)
+		fmt.Println(name, version)
 		return
 	case errors.Is(err, flag.ErrHelp):
 		return
