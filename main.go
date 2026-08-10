@@ -13,6 +13,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"log/slog"
 	"net"
@@ -60,6 +61,10 @@ func main() {
 		level = slog.LevelDebug
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	if *refresh < 0 {
+		log.Error("-refresh must be zero or positive", "refresh", *refresh)
+		os.Exit(2)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -114,7 +119,12 @@ type monitor struct {
 	attempts    int       // kinit attempts in the current up-period
 	lastAttempt time.Time // persists across transitions: flap guard
 	expiresAt   time.Time // TGT expiry as of the last klist read; zero = unknown
-	lastSuccess time.Time // last successful kinit, for capping the refresh margin
+
+	// ticketLife caps the refresh margin. It is the true lifetime of
+	// the last ticket seen: time-to-expiry measured at our own kinit,
+	// or the Issued→Expires span of a ticket read from the cache —
+	// never derived from anchors an out-of-band kinit could skew.
+	ticketLife time.Duration
 }
 
 // discoverKDC resolves which KDC to probe before running kinit:
@@ -198,7 +208,6 @@ func (m *monitor) tryKinit(ctx context.Context) {
 		return
 	}
 	m.done = true
-	m.lastSuccess = time.Now()
 	if m.refresh <= 0 {
 		m.log.Info("kinit succeeded", "attempt", m.attempts)
 		return
@@ -207,6 +216,7 @@ func (m *monitor) tryKinit(ctx context.Context) {
 	switch {
 	case ok && exp.After(time.Now()):
 		m.expiresAt = exp
+		m.ticketLife = time.Until(exp)
 		m.log.Info("kinit succeeded", "attempt", m.attempts, "expires", exp)
 		// A ticket acquired moments ago should read as issued about
 		// now; a large gap means the klist timestamps are not in
@@ -216,10 +226,12 @@ func (m *monitor) tryKinit(ctx context.Context) {
 		}
 	case ok: // a fresh ticket reading as already expired: timestamps unusable
 		m.expiresAt = time.Now().Add(fallbackLifetime)
+		m.ticketLife = fallbackLifetime
 		m.log.Warn("kinit succeeded but the fresh ticket reads as expired; assuming a lifetime",
 			"read", exp, "assumed", fallbackLifetime)
 	default:
 		m.expiresAt = time.Now().Add(fallbackLifetime)
+		m.ticketLife = fallbackLifetime
 		m.log.Warn("kinit succeeded but the ticket expiry is unreadable; assuming a lifetime",
 			"assumed", fallbackLifetime)
 	}
@@ -230,25 +242,26 @@ func (m *monitor) tryKinit(ctx context.Context) {
 // on every tick; it is re-read once the cached time nears, which also
 // notices tickets acquired behind vpn-kinit's back (a manual kinit).
 func (m *monitor) ticketExpiring(ctx context.Context) bool {
-	margin := m.margin()
-	if time.Until(m.expiresAt) > margin {
+	if time.Until(m.expiresAt) > m.margin() {
 		return false
 	}
-	if exp, _, ok := m.ticketExpiry(ctx); ok {
-		m.expiresAt = exp
-		return time.Until(exp) <= margin
+	exp, iss, ok := m.ticketExpiry(ctx)
+	if !ok {
+		return true // no readable ticket: treat as expired
 	}
-	return true // no readable ticket: treat as expired
+	m.expiresAt = exp
+	if life := exp.Sub(iss); !iss.IsZero() && life > 0 {
+		m.ticketLife = life // so the margin cap applies to tickets vpn-kinit didn't acquire
+	}
+	return time.Until(exp) <= m.margin()
 }
 
 // margin returns the effective refresh margin: -refresh, capped at half
 // the last observed ticket lifetime so a margin misconfigured to exceed
 // the lifetime cannot turn into a kinit-per-cooldown loop.
 func (m *monitor) margin() time.Duration {
-	if !m.lastSuccess.IsZero() {
-		if life := m.expiresAt.Sub(m.lastSuccess); life > 0 && life/2 < m.refresh {
-			return life / 2
-		}
+	if m.ticketLife > 0 && m.ticketLife/2 < m.refresh {
+		return m.ticketLife / 2
 	}
 	return m.refresh
 }
@@ -261,7 +274,13 @@ func (m *monitor) ticketExpiry(ctx context.Context) (expires, issued time.Time, 
 	defer cancel()
 	out, err := exec.CommandContext(cctx, m.klist, "--json").Output()
 	if err != nil {
-		m.log.Debug("klist failed", "klist", m.klist, "err", err)
+		var stderr []byte
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			stderr = ee.Stderr
+		}
+		m.log.Debug("klist failed", "klist", m.klist, "err", err,
+			"stderr", strings.TrimSpace(string(stderr)))
 		return time.Time{}, time.Time{}, false
 	}
 	var cache struct {
@@ -289,7 +308,9 @@ func (m *monitor) ticketExpiry(ctx context.Context) (expires, issued time.Time, 
 		if err != nil {
 			continue
 		}
-		iss, _ := time.ParseInLocation(klistTimestamp, t.Issued, time.Local) // zero on error
+		// A failed parse yields the zero time, which disables the
+		// optional issue-time uses (sanity warning, lifetime cap).
+		iss, _ := time.ParseInLocation(klistTimestamp, t.Issued, time.Local)
 		if t.Principal == tgt {
 			return exp, iss, true
 		}

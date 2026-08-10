@@ -117,8 +117,9 @@ On each trigger it checks whether the interface exists and is up. On a
 down→up transition it probes the KDC over TCP (port 88) and, once
 reachable, runs `kinit`. A failed kinit is retried on later triggers
 (at most 10 attempts per connect, rate-limited by `-cooldown`); failed
-KDC probes are free and never count as attempts. Nothing runs again
-until the tunnel goes down and comes back up.
+KDC probes are free and never count as attempts. With refresh disabled
+(`-refresh 0`), nothing runs again until the tunnel goes down and
+comes back up.
 
 Route messages are never parsed — they are only a hint to re-check
 interface state — so kernel-dropped or truncated messages are
