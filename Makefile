@@ -25,13 +25,16 @@ vet:
 # gofmt is also enforced by the gofmt formatter in .golangci.yml; this target
 # repeats it so `make check` catches unformatted code with no extra tooling.
 fmt:
-	@test -z "$$(gofmt -l .)" || (gofmt -l . && exit 1)
+	@unformatted="$$(gofmt -l .)"; \
+	  test -z "$$unformatted" || { echo "$$unformatted"; exit 1; }
 
 # CI runs golangci-lint via golangci-lint-action, so a missing local binary is
-# a skip rather than a failure.
+# a skip rather than a failure. firstword so GOLANGCI_LINT can carry flags.
 lint:
-	@command -v $(GOLANGCI_LINT) >/dev/null || \
-	    { echo "$(GOLANGCI_LINT) not installed, skipping"; exit 0; }; \
+	@command -v $(firstword $(GOLANGCI_LINT)) >/dev/null || \
+	    { echo "$(firstword $(GOLANGCI_LINT)) not installed; skipping golangci-lint," \
+	           "including the goimports and gofumpt checks that CI still enforces"; \
+	      exit 0; }; \
 	  $(GOLANGCI_LINT) config verify && $(GOLANGCI_LINT) run ./...
 
 check: vet fmt lint
