@@ -42,8 +42,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        # macOS is the only platform vpn-kinit ships for; ubuntu runs the
+        # portable code (route_other.go stands in for the route monitor)
+        # so a Linux development host stays a supported place to work.
         os:
         - macos-latest
+        - ubuntu-latest
     steps:
       - name: Clone the code
         uses: actions/checkout@v7
@@ -59,7 +63,12 @@ jobs:
         run: make build
 
       - name: Running Tests
-        run: go test ./...
+        run: make test
+
+      - name: Coverage
+        run: |
+          go test -coverprofile=cover.out ./...
+          go tool cover -func=cover.out
 
   conclusion:
     needs:
