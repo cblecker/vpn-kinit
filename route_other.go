@@ -17,8 +17,8 @@ import (
 const defaultInterface = "utun100"
 
 // routeListen has no routing socket to watch here, so it delivers no
-// events and simply waits for shutdown. The ticker in run() remains the
-// only trigger source.
+// events and simply waits for shutdown. run() still evaluates once at
+// startup; the ticker supplies every trigger after that.
 func routeListen(ctx context.Context, _ chan<- struct{}, log *slog.Logger) {
 	log.Debug("route monitoring is not available on this platform")
 	<-ctx.Done()

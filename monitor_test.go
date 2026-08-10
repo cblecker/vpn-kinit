@@ -37,11 +37,13 @@ func script(t *testing.T, dir, name, body string) string {
 
 // recorder returns a script that appends a line to a log file on every
 // invocation, along with the path of that log, so a test can assert how
-// many times -- or whether at all -- the program ran.
+// many times -- or whether at all -- the program ran. The path is quoted
+// because t.TempDir() builds it from the test name, and the characters it
+// lets through include shell metacharacters ("$&(){}~" and a space).
 func recorder(t *testing.T, dir, name, body string) (path, calls string) {
 	t.Helper()
 	calls = filepath.Join(dir, name+".calls")
-	return script(t, dir, name, `echo "$@" >> `+calls+"\n"+body), calls
+	return script(t, dir, name, `echo "$@" >> '`+calls+`'`+"\n"+body), calls
 }
 
 // callCount reports how many times a recorder script ran.
@@ -84,20 +86,12 @@ func klistScript(t *testing.T, dir, out string) (path, calls string) {
 // for an empty credential cache.
 const noTicket = `{"principal":"me@EXAMPLE.COM","tickets":[]}`
 
-// deadAddr returns an address nothing is listening on, by binding a port
-// and immediately releasing it.
-func deadAddr(t *testing.T) string {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := l.Addr().String()
-	if err := l.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return addr
-}
+// deadAddr is an address nothing can be listening on: binding port 0 has
+// the kernel assign an ephemeral port instead, so no socket ever holds
+// port 0 itself and the dial always refuses. Taking a real port and
+// releasing it would leave a window for another process to claim it
+// before the dial, which is a flake rather than a failure.
+const deadAddr = "127.0.0.1:0"
 
 // setKrb5Conf points KDC discovery at a fixture for the duration of the
 // test; empty content means the file does not exist.
@@ -105,11 +99,11 @@ func setKrb5Conf(t *testing.T, content string) {
 	t.Helper()
 	old := krb5ConfPath
 	t.Cleanup(func() { krb5ConfPath = old })
-	path := filepath.Join(t.TempDir(), "krb5.conf")
 	if content == "" {
 		krb5ConfPath = filepath.Join(t.TempDir(), "absent.conf")
 		return
 	}
+	path := filepath.Join(t.TempDir(), "krb5.conf")
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -422,7 +416,7 @@ func TestTryKinit(t *testing.T) {
 		m := &monitor{
 			kinit:    kinit,
 			klist:    filepath.Join(dir, "klist"),
-			kdc:      deadAddr(t),
+			kdc:      deadAddr,
 			cooldown: time.Hour,
 			refresh:  time.Hour,
 			log:      discardLog(),
@@ -622,7 +616,7 @@ func TestKDCReachable(t *testing.T) {
 	})
 
 	t.Run("a closed port is not reachable", func(t *testing.T) {
-		m := &monitor{kdc: deadAddr(t), log: discardLog()}
+		m := &monitor{kdc: deadAddr, log: discardLog()}
 		if m.kdcReachable() {
 			t.Error("kdcReachable() = true for a closed port")
 		}
@@ -708,15 +702,15 @@ func TestDiscoverKDC(t *testing.T) {
 }
 
 func TestWithDefaultPort(t *testing.T) {
-	tests := []struct{ in, want string }{
-		{"kdc.example.com", "kdc.example.com:88"},
-		{"kdc.example.com:8888", "kdc.example.com:8888"},
-		{"10.0.0.1", "10.0.0.1:88"},
-		{"::1", "[::1]:88"},
-		{"[::1]:8888", "[::1]:8888"},
+	tests := []struct{ name, in, want string }{
+		{"a bare hostname takes the Kerberos port", "kdc.example.com", "kdc.example.com:88"},
+		{"an explicit port is kept", "kdc.example.com:8888", "kdc.example.com:8888"},
+		{"a bare IPv4 address takes the Kerberos port", "10.0.0.1", "10.0.0.1:88"},
+		{"a bare IPv6 address is bracketed", "::1", "[::1]:88"},
+		{"a bracketed IPv6 address with a port is kept", "[::1]:8888", "[::1]:8888"},
 	}
 	for _, tt := range tests {
-		t.Run(tt.in, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			if got := withDefaultPort(tt.in); got != tt.want {
 				t.Errorf("withDefaultPort(%q) = %q, want %q", tt.in, got, tt.want)
 			}

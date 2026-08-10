@@ -73,9 +73,12 @@ func routeListen(ctx context.Context, notify chan<- struct{}, log *slog.Logger) 
 	}
 }
 
-// readLoop notifies on every route message until the socket fails,
-// returning the error that ended it so the caller can reopen. A read
-// interrupted by ctx being cancelled is a clean shutdown, not a failure.
+// readLoop pokes for every route message until the socket fails,
+// returning the error that ended it so the caller can reopen. A poke is
+// not a delivered notification: bursts coalesce in the capacity-1
+// channel, which is the point -- one re-evaluation answers a burst as
+// well as many would. A read interrupted by ctx being cancelled is a
+// clean shutdown, not a failure.
 func readLoop(ctx context.Context, f *os.File, notify chan<- struct{}) error {
 	buf := make([]byte, readBufSize)
 	for {

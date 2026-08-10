@@ -49,7 +49,11 @@ func TestReadLoop(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer func() { _ = w.Close() }()
+		defer func() {
+			if err := w.Close(); err != nil {
+				t.Errorf("close pipe writer: %v", err)
+			}
+		}()
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -87,7 +91,11 @@ func TestReadLoop(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer func() { _ = r.Close() }()
+		defer func() {
+			if err := r.Close(); err != nil {
+				t.Errorf("close pipe reader: %v", err)
+			}
+		}()
 
 		notify := make(chan struct{}, 1)
 		done := make(chan error, 1)
