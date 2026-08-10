@@ -88,6 +88,11 @@ array of `LaunchAgents/com.cblecker.vpn-kinit.plist.in`, then re-run
 | `-refresh`   | `1h`             | Re-kinit when the ticket has less than this left (`0` disables) |
 | `-kdc`       | auto             | KDC to probe as `host[:port]`                    |
 | `-debug`     | off              | Debug logging (including failed KDC probes)      |
+| `-version`   | —                | Print the version and exit                       |
+
+`vpn-kinit -h` prints the same list; the running version is also in the
+`vpn-kinit started` log line, which is the quickest way to tell which
+build launchd actually has loaded.
 
 Anything after a `--` separator is passed through as arguments to
 kinit — useful for keytab-based setups (e.g.

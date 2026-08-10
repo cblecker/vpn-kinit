@@ -24,7 +24,9 @@ builds:
     flags:
       - -trimpath
     ldflags:
-      - -s -w
+      # .Tag, not .Version, so a release build reports the same string as
+      # `make build`'s git describe (v1.2.3, not 1.2.3).
+      - -s -w -X main.version={{ .Tag }}
 
 release:
   github:

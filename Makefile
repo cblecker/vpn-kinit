@@ -5,6 +5,7 @@ BINDIR  := $(PREFIX)/bin
 PLIST_IN  := LaunchAgents/$(LABEL).plist.in
 PLIST_OUT := $(HOME)/Library/LaunchAgents/$(LABEL).plist
 UID     := $(shell id -u)
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
 export GOOS        := darwin
 export CGO_ENABLED := 0
@@ -14,7 +15,7 @@ export CGO_ENABLED := 0
 all: build
 
 build:
-	go build -trimpath -o bin/$(BINARY) .
+	go build -trimpath -ldflags "-X main.version=$(VERSION)" -o bin/$(BINARY) .
 
 vet:
 	go vet ./...
