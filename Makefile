@@ -12,7 +12,7 @@ export CGO_ENABLED := 0
 
 GOLANGCI_LINT ?= golangci-lint
 
-.PHONY: all build vet fmt lint check install uninstall clean
+.PHONY: all build vet lint check install uninstall clean
 
 all: build
 
@@ -22,22 +22,19 @@ build:
 vet:
 	go vet ./...
 
-# gofmt is also enforced by the gofmt formatter in .golangci.yml; this target
-# repeats it so `make check` catches unformatted code with no extra tooling.
-fmt:
-	@unformatted="$$(gofmt -l .)"; \
-	  test -z "$$unformatted" || { echo "$$unformatted"; exit 1; }
-
-# CI runs golangci-lint via golangci-lint-action, so a missing local binary is
-# a skip rather than a failure. firstword so GOLANGCI_LINT can carry flags.
+# `make check` is a local convenience; CI never calls it and enforces all of
+# this itself, through golangci-lint-action and `go test`. So a missing
+# golangci-lint is a skip rather than a failure, and gofmt is left to the
+# formatter in .golangci.yml instead of being repeated here. firstword so
+# GOLANGCI_LINT can carry flags.
 lint:
 	@command -v $(firstword $(GOLANGCI_LINT)) >/dev/null || \
 	    { echo "$(firstword $(GOLANGCI_LINT)) not installed; skipping golangci-lint," \
-	           "including the goimports and gofumpt checks that CI still enforces"; \
+	           "including the gofmt, goimports and gofumpt checks that CI enforces"; \
 	      exit 0; }; \
 	  $(GOLANGCI_LINT) config verify && $(GOLANGCI_LINT) run ./...
 
-check: vet fmt lint
+check: vet lint
 
 install: build
 	@test "$$(uname -s)" = "Darwin" || (echo "install must run on macOS" && exit 1)

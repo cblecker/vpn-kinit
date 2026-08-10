@@ -71,7 +71,7 @@ Homebrew service first if you have one running, so the two copies don't
 both fire.
 
 Other targets: `make build` (cross-compiles for darwin from any host)
-and `make check` (`go vet` + gofmt + golangci-lint, the last skipped when
+and `make check` (`go vet` + golangci-lint, the latter skipped when
 golangci-lint is not installed).
 
 ## Configuration
