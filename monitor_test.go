@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -160,6 +161,9 @@ func TestTicketExpiry(t *testing.T) {
 		// wantExpires and wantIssued are klist timestamps; an empty
 		// wantExpires means the read is expected to fail.
 		wantExpires, wantIssued string
+		// noTicket marks a failed read as errNoTicket rather than a
+		// klist that could not be run or parsed.
+		noTicket bool
 	}{
 		{
 			// A cross-realm TGT can outlive the local one; refreshing on
@@ -179,10 +183,22 @@ func TestTicketExpiry(t *testing.T) {
 			name: "service tickets are not TGTs",
 			out: `{"principal":"me@EXAMPLE.COM","tickets":[
 				{"Issued":"` + iss + `","Expires":"` + exp8 + `","Principal":"host/x@EXAMPLE.COM"}]}`,
+			noTicket: true,
 		},
 		{
-			name: "an unparseable expiry skips the ticket",
+			// A TGT is present, so this is a klist format problem, not a
+			// missing ticket: it must not be errNoTicket, or a fine
+			// ticket would raise the missing-ticket alert.
+			name: "a TGT with an unparseable expiry fails, but not as no ticket",
 			out:  klistJSON(iss, "not-a-timestamp"),
+		},
+		{
+			name: "an unparseable expiry skips that ticket",
+			out: `{"principal":"me@EXAMPLE.COM","tickets":[
+				{"Issued":"` + iss + `","Expires":"not-a-timestamp","Principal":"krbtgt/EXAMPLE.COM@EXAMPLE.COM"},
+				{"Issued":"` + iss + `","Expires":"` + exp10 + `","Principal":"krbtgt/B.COM@B.COM"}]}`,
+			wantExpires: exp10,
+			wantIssued:  iss,
 		},
 		{
 			// The issue time only feeds optional checks, so losing it
@@ -196,8 +212,16 @@ func TestTicketExpiry(t *testing.T) {
 			out:  "this is not json",
 		},
 		{
-			name: "empty cache",
-			out:  noTicket,
+			name:     "empty cache",
+			out:      noTicket,
+			noTicket: true,
+		},
+		{
+			// What macOS klist prints, with exit status 0, when the
+			// default cache does not exist.
+			name:     "no default cache",
+			out:      `{ "version" : 1 }`,
+			noTicket: true,
 		},
 		{
 			// No principal means no own-realm TGT to prefer; the
@@ -214,11 +238,14 @@ func TestTicketExpiry(t *testing.T) {
 			klist, _ := klistScript(t, dir, tt.out)
 			m := &monitor{klist: klist, log: discardLog()}
 
-			exp, issued, ok := m.ticketExpiry(context.Background())
-			if ok != (tt.wantExpires != "") {
-				t.Fatalf("ticketExpiry() ok = %v, want %v", ok, tt.wantExpires != "")
+			exp, issued, err := m.ticketExpiry(context.Background())
+			if (err == nil) != (tt.wantExpires != "") {
+				t.Fatalf("ticketExpiry() err = %v, want success %v", err, tt.wantExpires != "")
 			}
-			if !ok {
+			if err != nil {
+				if got := errors.Is(err, errNoTicket); got != tt.noTicket {
+					t.Errorf("errors.Is(err, errNoTicket) = %v, want %v (err = %v)", got, tt.noTicket, err)
+				}
 				return
 			}
 			if got := exp.Format(klistTimestamp); got != tt.wantExpires {
@@ -241,8 +268,14 @@ func TestTicketExpiry(t *testing.T) {
 // it, which is the normal case on a host with no Kerberos tooling.
 func TestTicketExpiryUnrunnable(t *testing.T) {
 	m := &monitor{klist: filepath.Join(t.TempDir(), "klist"), log: discardLog()}
-	if _, _, ok := m.ticketExpiry(context.Background()); ok {
-		t.Error("ticketExpiry() ok = true for a klist that does not exist")
+	_, _, err := m.ticketExpiry(context.Background())
+	if err == nil {
+		t.Fatal("ticketExpiry() err = nil for a klist that does not exist")
+	}
+	// Not errNoTicket: an unrunnable klist says nothing about the cache,
+	// so tryKinit must fall back to an assumed lifetime, not retry.
+	if errors.Is(err, errNoTicket) {
+		t.Errorf("ticketExpiry() err = errNoTicket for a klist that does not exist")
 	}
 }
 
@@ -394,6 +427,85 @@ func TestTryKinit(t *testing.T) {
 		}
 	})
 
+	t.Run("a successful kinit with no ticket in the cache alerts and stops", func(t *testing.T) {
+		dir := t.TempDir()
+		kinit, kinitCalls := recorder(t, dir, "kinit", "exit 0")
+		klist, _ := klistScript(t, dir, `{ "version" : 1 }`)
+		var alerts []string
+		m := &monitor{
+			kinit: kinit, klist: klist, refresh: time.Hour, log: discardLog(),
+			notify: func(_ context.Context, title, _ string) error {
+				alerts = append(alerts, title)
+				return nil
+			},
+		}
+		m.tryKinit(ctx)
+
+		if m.done {
+			t.Error("done = true with no ticket in the default cache")
+		}
+		if !m.expiresAt.IsZero() || m.ticketLife != 0 {
+			t.Errorf("expiresAt = %s, ticketLife = %s; want both unset", m.expiresAt, m.ticketLife)
+		}
+		if len(alerts) != 1 {
+			t.Errorf("posted %d notifications, want 1", len(alerts))
+		}
+
+		// Every retry would strand another ticket in a stray cache, so
+		// nothing more runs -- or alerts -- until the next reconnect,
+		// even with no cooldown.
+		for range 5 {
+			m.tryKinit(ctx)
+		}
+		if n := callCount(t, kinitCalls); n != 1 {
+			t.Errorf("kinit ran %d times, want 1", n)
+		}
+		if len(alerts) != 1 {
+			t.Errorf("posted %d notifications after retries, want 1", len(alerts))
+		}
+	})
+
+	t.Run("a TGT with an unreadable expiry assumes a lifetime without alerting", func(t *testing.T) {
+		dir := t.TempDir()
+		kinit, _ := recorder(t, dir, "kinit", "exit 0")
+		klist, _ := klistScript(t, dir, klistJSON(stamp(0), "not-a-timestamp"))
+		var alerts int
+		m := &monitor{
+			kinit: kinit, klist: klist, refresh: time.Hour, log: discardLog(),
+			notify: func(context.Context, string, string) error {
+				alerts++
+				return nil
+			},
+		}
+		m.tryKinit(ctx)
+
+		if !m.done {
+			t.Error("done = false after a successful kinit")
+		}
+		if m.ticketLife != fallbackLifetime {
+			t.Errorf("ticketLife = %s, want the %s fallback", m.ticketLife, fallbackLifetime)
+		}
+		if alerts != 0 {
+			t.Errorf("posted %d notifications for a ticket that exists, want 0", alerts)
+		}
+	})
+
+	t.Run("a failed notification is not fatal", func(t *testing.T) {
+		dir := t.TempDir()
+		kinit, _ := recorder(t, dir, "kinit", "exit 0")
+		klist, _ := klistScript(t, dir, `{ "version" : 1 }`)
+		m := &monitor{
+			kinit: kinit, klist: klist, refresh: time.Hour, log: discardLog(),
+			notify: func(context.Context, string, string) error {
+				return errors.New("no notification center")
+			},
+		}
+		m.tryKinit(ctx) // must not panic; the log line is the record
+		if m.attempts != maxAttempts {
+			t.Errorf("attempts = %d, want the cap of %d", m.attempts, maxAttempts)
+		}
+	})
+
 	t.Run("a fresh ticket reading as expired assumes a lifetime", func(t *testing.T) {
 		dir := t.TempDir()
 		kinit, _ := recorder(t, dir, "kinit", "exit 0")
@@ -455,7 +567,9 @@ func TestTryKinit(t *testing.T) {
 	})
 }
 
-// harness drives evaluate with a fake interface, kinit, and klist.
+// harness drives evaluate with a fake interface, kinit, and klist. Like
+// the real pair, kinit leaves a fresh ticket in the cache, which klist
+// reports in place of its starting output from then on.
 type harness struct {
 	m          *monitor
 	up         bool
@@ -466,8 +580,11 @@ func newHarness(t *testing.T, klistOut string) *harness {
 	t.Helper()
 	dir := t.TempDir()
 	h := &harness{}
-	kinit, calls := recorder(t, dir, "kinit", "exit 0")
-	klist, _ := klistScript(t, dir, klistOut)
+	cache := filepath.Join(dir, "cache")
+	kinit, calls := recorder(t, dir, "kinit",
+		"cat > '"+cache+"' <<'EOJ'\n"+klistJSON(stamp(0), stamp(10*time.Hour))+"\nEOJ")
+	klist, _ := recorder(t, dir, "klist",
+		"cat '"+cache+"' 2>/dev/null && exit 0\ncat <<'EOJ'\n"+klistOut+"\nEOJ")
 	h.kinitCalls = calls
 	h.m = &monitor{
 		iface:   "tun-test0",

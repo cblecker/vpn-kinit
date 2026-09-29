@@ -42,6 +42,7 @@ const (
 	kinitTimeout   = 30 * time.Second
 	probeTimeout   = 3 * time.Second
 	klistTimeout   = 5 * time.Second
+	notifyTimeout  = 5 * time.Second
 	maxAttempts    = 10 // kinit attempts per up-transition
 	kerberosPort   = "88"
 
@@ -70,6 +71,10 @@ type config struct {
 // errVersion is returned by parseFlags for -version, which prints the
 // version and exits successfully rather than starting the daemon.
 var errVersion = errors.New("version requested")
+
+// errNoTicket is returned by ticketExpiry when klist ran and its output
+// parsed, but the default credential cache holds no usable krbtgt.
+var errNoTicket = errors.New("no ticket in the default credential cache")
 
 // parseFlags parses args into a config. It writes its own diagnostics
 // (bad flags, invalid values, usage) to out, the way flag.FlagSet does,
@@ -206,6 +211,10 @@ type monitor struct {
 	// to drive the transitions in evaluate.
 	ifaceUp func(string) bool
 
+	// notify shows the user a desktop notification. Nil, outside tests,
+	// means osascript; tests record the calls instead of posting them.
+	notify func(ctx context.Context, title, message string) error
+
 	wasUp       bool
 	done        bool      // kinit succeeded for the current up-period
 	attempts    int       // kinit attempts in the current up-period
@@ -296,7 +305,10 @@ func (m *monitor) evaluate(ctx context.Context) {
 // the attempt cap keeps a hopeless configuration from retrying forever,
 // the cooldown keeps a flapping tunnel from running kinit per event, and
 // the KDC probe costs neither -- a tunnel that is up but not yet routing
-// is the normal case, not a failure to spend attempts on.
+// is the normal case, not a failure to spend attempts on. A kinit that
+// exits 0 but leaves no ticket in the default cache ends the up-period
+// with a notification: nothing will find a ticket stored anywhere else,
+// and retrying would only strand more of them.
 func (m *monitor) tryKinit(ctx context.Context) {
 	if m.attempts >= maxAttempts {
 		return // gave up for this up-period; logged when the cap was hit
@@ -321,14 +333,27 @@ func (m *monitor) tryKinit(ctx context.Context) {
 		}
 		return
 	}
-	m.done = true
 	if m.refresh <= 0 {
+		m.done = true
 		m.log.Info("kinit succeeded", "attempt", m.attempts)
 		return
 	}
-	exp, issued, ok := m.ticketExpiry(ctx)
+	exp, issued, err := m.ticketExpiry(ctx)
+	if errors.Is(err, errNoTicket) {
+		// klist read the default cache fine and it holds no TGT: the
+		// ticket went somewhere nothing else will look. Retrying would
+		// only strand more tickets in stray caches, so stop for this
+		// up-period and tell the user, who has to clear the caches.
+		m.attempts = maxAttempts
+		m.log.Error("kinit succeeded but the default credential cache has no ticket; giving up until next reconnect",
+			"interface", m.iface, "hint", "another cache may hold it; run kdestroy -A && kinit")
+		m.alert(ctx, "Kerberos ticket missing",
+			"kinit succeeded but the default cache has no ticket. Run: kdestroy -A && kinit")
+		return
+	}
+	m.done = true
 	switch {
-	case ok && exp.After(time.Now()):
+	case err == nil && exp.After(time.Now()):
 		m.expiresAt = exp
 		m.ticketLife = time.Until(exp)
 		m.log.Info("kinit succeeded", "attempt", m.attempts, "expires", exp)
@@ -338,7 +363,7 @@ func (m *monitor) tryKinit(ctx context.Context) {
 		if gap := time.Since(issued); !issued.IsZero() && (gap > time.Hour || gap < -time.Hour) {
 			m.log.Warn("fresh ticket's issue time is far from now; klist timestamps may not be local time", "issued", issued)
 		}
-	case ok: // a fresh ticket reading as already expired: timestamps unusable
+	case err == nil: // a fresh ticket reading as already expired: timestamps unusable
 		m.expiresAt = time.Now().Add(fallbackLifetime)
 		m.ticketLife = fallbackLifetime
 		m.log.Warn("kinit succeeded but the fresh ticket reads as expired; assuming a lifetime",
@@ -351,6 +376,36 @@ func (m *monitor) tryKinit(ctx context.Context) {
 	}
 }
 
+// alert shows the user a desktop notification, for failures that need
+// them to act. The log is the record; a notification that cannot be
+// posted is only worth a warning there.
+func (m *monitor) alert(ctx context.Context, title, message string) {
+	ctx, cancel := context.WithTimeout(ctx, notifyTimeout)
+	defer cancel()
+	notify := m.notify
+	if notify == nil {
+		notify = osascriptNotify
+	}
+	if err := notify(ctx, title, message); err != nil {
+		m.log.Warn("could not post notification", "err", err)
+	}
+}
+
+// osascriptNotify posts a notification through AppleScript. The text is
+// passed as arguments rather than spliced into the script, so nothing in
+// it needs escaping.
+func osascriptNotify(ctx context.Context, title, message string) error {
+	out, err := exec.CommandContext(ctx, "/usr/bin/osascript",
+		"-e", "on run argv",
+		"-e", "display notification (item 2 of argv) with title (item 1 of argv)",
+		"-e", "end run",
+		title, message).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // ticketExpiring reports whether the TGT is missing or within the
 // refresh margin of expiry. The cached expiry keeps klist from running
 // on every tick; it is re-read once the cached time nears, which also
@@ -359,8 +414,8 @@ func (m *monitor) ticketExpiring(ctx context.Context) bool {
 	if time.Until(m.expiresAt) > m.margin() {
 		return false
 	}
-	exp, iss, ok := m.ticketExpiry(ctx)
-	if !ok {
+	exp, iss, err := m.ticketExpiry(ctx)
+	if err != nil {
 		return true // no readable ticket: treat as expired
 	}
 	m.expiresAt = exp
@@ -383,7 +438,9 @@ func (m *monitor) margin() time.Duration {
 // ticketExpiry reads the TGT's expiry and issue time from
 // `klist --json`. It prefers the ticket-granting ticket for the cache
 // principal's own realm, falling back to the latest-expiring krbtgt.
-func (m *monitor) ticketExpiry(ctx context.Context) (expires, issued time.Time, ok bool) {
+// It returns errNoTicket when klist's output parses but holds no usable
+// krbtgt, and klist's own error when it could not be run or parsed.
+func (m *monitor) ticketExpiry(ctx context.Context) (expires, issued time.Time, err error) {
 	cctx, cancel := context.WithTimeout(ctx, klistTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(cctx, m.klist, "--json").Output()
@@ -395,7 +452,7 @@ func (m *monitor) ticketExpiry(ctx context.Context) (expires, issued time.Time, 
 		}
 		m.log.Debug("klist failed", "klist", m.klist, "err", err,
 			"stderr", strings.TrimSpace(string(stderr)))
-		return time.Time{}, time.Time{}, false
+		return time.Time{}, time.Time{}, err
 	}
 	var cache struct {
 		Principal string `json:"principal"`
@@ -407,17 +464,19 @@ func (m *monitor) ticketExpiry(ctx context.Context) (expires, issued time.Time, 
 	}
 	if err := json.Unmarshal(out, &cache); err != nil {
 		m.log.Debug("unparseable klist output", "err", err)
-		return time.Time{}, time.Time{}, false
+		return time.Time{}, time.Time{}, err
 	}
 	var tgt string
 	if i := strings.LastIndex(cache.Principal, "@"); i >= 0 {
 		realm := cache.Principal[i+1:]
 		tgt = "krbtgt/" + realm + "@" + realm
 	}
+	var sawTGT bool
 	for _, t := range cache.Tickets {
 		if !strings.HasPrefix(t.Principal, "krbtgt/") {
 			continue
 		}
+		sawTGT = true
 		exp, err := time.ParseInLocation(klistTimestamp, t.Expires, time.Local)
 		if err != nil {
 			continue
@@ -426,13 +485,27 @@ func (m *monitor) ticketExpiry(ctx context.Context) (expires, issued time.Time, 
 		// optional issue-time uses (sanity warning, lifetime cap).
 		iss, _ := time.ParseInLocation(klistTimestamp, t.Issued, time.Local)
 		if t.Principal == tgt {
-			return exp, iss, true
+			return exp, iss, nil
 		}
 		if exp.After(expires) {
-			expires, issued, ok = exp, iss, true
+			expires, issued = exp, iss
 		}
 	}
-	return expires, issued, ok
+	switch {
+	case !expires.IsZero():
+		return expires, issued, nil
+	case sawTGT:
+		// A TGT is there but its expiry is unreadable -- a klist format
+		// change, not a missing ticket -- so the caller must not treat
+		// it as errNoTicket.
+		m.log.Debug("unparseable ticket expiry in klist output")
+		return time.Time{}, time.Time{}, errors.New("unparseable TGT expiry in klist output")
+	default:
+		// Includes an empty default cache, which macOS klist reports as
+		// `{ "version" : 1 }` with exit status 0.
+		m.log.Debug("no ticket in the default credential cache", "cache_exists", cache.Principal != "")
+		return time.Time{}, time.Time{}, errNoTicket
+	}
 }
 
 // kdcReachable reports whether the KDC accepts TCP connections. When no

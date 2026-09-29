@@ -185,6 +185,18 @@ KDC probes, which is what to look at when the interface comes up but
 kinit never runs, and failed or unparseable `klist` reads, which is what
 to look at when kinit runs but the ticket is never refreshed.
 
+If you get a "Kerberos ticket missing" notification (logged as `kinit
+succeeded but the default credential cache has no ticket`), macOS has
+lost track of which credential cache is the default: plain `klist`
+reports `Cache not found: API:…` even though `klist -l` lists a cache
+holding your ticket, and `kswitch` does not fix it. vpn-kinit stops
+running kinit until the tunnel next reconnects, since each run would
+only strand another ticket. Clear the caches and get a fresh ticket:
+
+```sh
+kdestroy -A && kinit
+```
+
 Since the Homebrew service takes no flags, the way to get debug output
 from a Homebrew install is to stop the service and run it in the
 foreground, where the same log goes straight to your terminal:
